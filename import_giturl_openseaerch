@@ -34,7 +34,7 @@ from urllib3.util.retry import Retry
 # ---------------------------------------------------------------------------
 
 CONFIG: dict[str, Any] = {
-    "github_url": "https://github.com/zetaris/SaaS-Raina-VersionControl",  # e.g. https://github.com/zetaris/SaaS-Raina-VersionControl
+    "github_url": "https://github.com/example",  # e.g. git repo
     "github_token": "*****",  
     "branch": "release",  # GitHub branch names are case-sensitive
     "base_path": ".",  # folder containing index folders
