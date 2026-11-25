@@ -1,0 +1,666 @@
+#!/usr/bin/env python3
+"""Restore OpenSearch index backups stored in a GitHub repository.
+
+This file is intentionally standalone: it does not import the FastAPI app.  Its
+only third-party dependency is ``requests``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import getpass
+import io
+import json
+import os
+import re
+import sys
+import tarfile
+from dataclasses import dataclass
+from typing import Any, BinaryIO, Iterable
+from urllib.parse import quote, urlparse
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+# ---------------------------------------------------------------------------
+# DIRECT-RUN CONFIGURATION
+#
+# Fill these values, then run:
+#     python3 scripts/restore_opensearch_from_github.py
+#
+# ---------------------------------------------------------------------------
+
+CONFIG: dict[str, Any] = {
+    "github_url": "https://github.com/zetaris/SaaS-Raina-VersionControl",  # e.g. https://github.com/zetaris/SaaS-Raina-VersionControl
+    "github_token": "*****",  
+    "branch": "release",  # GitHub branch names are case-sensitive
+    "base_path": ".",  # folder containing index folders
+    "opensearch_scheme": "https",
+    "opensearch_host": "localhost",
+    "opensearch_port": 9200,
+    "opensearch_username": "admin",
+    "opensearch_password": "admin",  # or set OPENSEARCH_PASSWORD in the environment
+    "index_names": ["modeltraining","contract"],  # one or more indexes to restore
+    "restore_all": False,  # True restores every index discovered in GitHub
+    "list_only": False,  # True only lists recoverable indexes
+    "overwrite_existing": False,  # True deletes existing target indexes first
+    "bulk_size": 500,
+    "timeout_seconds": 120,
+    "verify_certs": False,  # local OpenSearch uses a self-signed certificate
+}
+
+
+BACKUP_NAME_RE = re.compile(r"_(\d{4}-\d{2}-\d{2}T\d{6}Z)\.tar\.gz$")
+INDEX_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._+-]*$")
+
+
+def join_repo_path(*parts: str) -> str:
+    return "/".join(part.strip("/") for part in parts if part and part.strip("/"))
+
+
+def encoded_repo_path(path: str) -> str:
+    return "/".join(quote(part, safe="") for part in path.split("/"))
+
+
+@dataclass(frozen=True)
+class GitHubLocation:
+    api_url: str
+    inferred_branch: str | None = None
+    inferred_base_path: str | None = None
+
+
+def parse_github_url(value: str) -> GitHubLocation:
+    """Accept repository, API, and GitHub /tree/<branch>/<path> URLs."""
+    url = value.strip().rstrip("/")
+    if url.startswith("https://api.github.com/repos/"):
+        parts = urlparse(url).path.strip("/").split("/")
+        if len(parts) < 3:
+            raise ValueError("Invalid GitHub API repository URL")
+        return GitHubLocation(f"https://api.github.com/repos/{parts[1]}/{parts[2]}")
+
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if parsed.netloc.lower() not in {"github.com", "www.github.com"} or len(parts) < 2:
+        raise ValueError(
+            "GitHub URL must look like https://github.com/owner/repository"
+        )
+
+    branch = None
+    base_path = None
+    if len(parts) >= 4 and parts[2] == "tree":
+        branch = parts[3]
+        tree_parts = parts[4:]
+        # A copied URL may point at <index>/backups. The restore code builds
+        # that path for every configured index, so /backups is not part of the
+        # common base path.
+        if tree_parts and tree_parts[-1] == "backups":
+            tree_parts = tree_parts[:-1]
+        base_path = "/".join(tree_parts) or None
+    return GitHubLocation(
+        f"https://api.github.com/repos/{parts[0]}/{parts[1]}", branch, base_path
+    )
+
+
+def new_session() -> requests.Session:
+    retry = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        backoff_factor=0.75,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "HEAD", "PUT", "POST", "DELETE"}),
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.mount("http://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+class GitHubClient:
+    def __init__(
+        self,
+        repo_api_url: str,
+        token: str,
+        branch: str,
+        timeout: int,
+    ) -> None:
+        self.repo_api_url = repo_api_url.rstrip("/")
+        self.branch = branch
+        self.timeout = timeout
+        self.session = new_session()
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "opensearch-github-restore-script",
+            }
+        )
+
+    def _contents(self, path: str) -> Any:
+        url = f"{self.repo_api_url}/contents"
+        if path:
+            url += f"/{encoded_repo_path(path)}"
+        response = self.session.get(
+            url, params={"ref": self.branch}, timeout=self.timeout
+        )
+        if response.status_code in (401, 403):
+            raise PermissionError(
+                "GitHub rejected the token or it cannot read this repository/branch"
+            )
+        if response.status_code == 404:
+            raise FileNotFoundError(
+                f"GitHub path not found on branch {self.branch!r}: {path or '.'}"
+            )
+        response.raise_for_status()
+        return response.json()
+
+    def discover_indexes(self, base_path: str) -> list[str]:
+        entries = self._contents(base_path)
+        if not isinstance(entries, list):
+            raise ValueError(f"GitHub base path is not a directory: {base_path or '.'}")
+
+        indexes: list[str] = []
+        for entry in entries:
+            if entry.get("type") != "dir":
+                continue
+            index_name = str(entry.get("name", ""))
+            if not INDEX_NAME_RE.fullmatch(index_name):
+                continue
+            try:
+                self.latest_backup(index_name, base_path)
+            except FileNotFoundError:
+                continue
+            except ValueError:
+                continue
+            indexes.append(index_name)
+        return sorted(indexes)
+
+    def latest_backup(self, index_name: str, base_path: str) -> dict[str, Any]:
+        backup_path = join_repo_path(base_path, index_name, "backups")
+        entries = self._contents(backup_path)
+        if not isinstance(entries, list):
+            raise ValueError(f"Backup path is not a directory: {backup_path}")
+
+        candidates = [
+            entry
+            for entry in entries
+            if entry.get("type") == "file"
+            and str(entry.get("name", "")).endswith(".tar.gz")
+        ]
+        if not candidates:
+            raise ValueError(f"No .tar.gz backup found in {backup_path}")
+
+        # ISO-style UTC timestamps sort lexicographically. Files without the
+        # expected timestamp remain supported and sort by filename.
+        def sort_key(entry: dict[str, Any]) -> tuple[str, str]:
+            name = str(entry.get("name", ""))
+            match = BACKUP_NAME_RE.search(name)
+            return (match.group(1) if match else "", name)
+
+        return max(candidates, key=sort_key)
+
+    def download(self, entry: dict[str, Any]) -> bytes:
+        download_url = entry.get("download_url")
+        if download_url:
+            response = self.session.get(download_url, timeout=self.timeout)
+            response.raise_for_status()
+            return response.content
+
+        # Refresh the Contents response; small files normally include base64
+        # content there. This also works when a caller supplied only a path.
+        path = str(entry.get("path", ""))
+        payload = self._contents(path)
+        content = payload.get("content") if isinstance(payload, dict) else None
+        if not content:
+            raise ValueError(f"GitHub did not provide downloadable content for {path}")
+        return base64.b64decode(content)
+
+
+def normalize_opensearch_url(value: str) -> str:
+    url = value.strip().rstrip("/")
+    if not url:
+        raise ValueError("OpenSearch host is required")
+    if "://" not in url:
+        url = f"https://{url}"
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("OpenSearch host must be a hostname or an http(s) URL")
+    return url
+
+
+class OpenSearchClient:
+    def __init__(
+        self,
+        base_url: str,
+        username: str,
+        password: str,
+        verify_certs: bool,
+        timeout: int,
+    ) -> None:
+        self.base_url = normalize_opensearch_url(base_url)
+        self.timeout = timeout
+        self.verify_certs = verify_certs
+        self.session = new_session()
+        self.session.auth = (username, password)
+        self.session.headers.update({"Accept": "application/json"})
+
+        if not verify_certs:
+            requests.packages.urllib3.disable_warnings(  # type: ignore[attr-defined]
+                requests.packages.urllib3.exceptions.InsecureRequestWarning  # type: ignore[attr-defined]
+            )
+
+    def request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        response = self.session.request(
+            method,
+            f"{self.base_url}{path}",
+            timeout=self.timeout,
+            verify=self.verify_certs,
+            **kwargs,
+        )
+        if response.status_code in (401, 403):
+            raise PermissionError(
+                "OpenSearch rejected the username/password or operation"
+            )
+        return response
+
+    def check_connection(self) -> None:
+        try:
+            response = self.request("GET", "/")
+        except requests.ConnectionError as exc:
+            raise ValueError(
+                f"Could not connect to OpenSearch at {self.base_url}. "
+                "Check opensearch_scheme, opensearch_host, and opensearch_port. "
+                "Local port 9200 commonly uses HTTPS, not HTTP."
+            ) from exc
+        response.raise_for_status()
+
+    def index_exists(self, index_name: str) -> bool:
+        response = self.request("HEAD", f"/{quote(index_name, safe='')}")
+        if response.status_code == 404:
+            return False
+        response.raise_for_status()
+        return True
+
+    def delete_index(self, index_name: str) -> None:
+        response = self.request("DELETE", f"/{quote(index_name, safe='')}")
+        if response.status_code != 404:
+            response.raise_for_status()
+
+    def create_index(
+        self, index_name: str, mapping: dict[str, Any], settings: dict[str, Any]
+    ) -> None:
+        mapping_body = mapping.get("mappings", mapping)
+        settings_body = prune_settings(settings)
+        body: dict[str, Any] = {}
+        if settings_body:
+            body["settings"] = settings_body
+        if mapping_body:
+            body["mappings"] = mapping_body
+        response = self.request(
+            "PUT", f"/{quote(index_name, safe='')}", json=body
+        )
+        if response.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Could not create OpenSearch index {index_name}: "
+                f"HTTP {response.status_code} {response.text[:1000]}"
+            )
+
+    def send_bulk(self, lines: list[str]) -> None:
+        response = self.request(
+            "POST",
+            "/_bulk",
+            params={"refresh": "true"},
+            headers={"Content-Type": "application/x-ndjson"},
+            data="\n".join(lines) + "\n",
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("errors"):
+            failed = next(
+                (
+                    item
+                    for item in payload.get("items", [])
+                    if item.get("index", {}).get("error")
+                ),
+                None,
+            )
+            raise RuntimeError(f"OpenSearch bulk restore failed: {failed}")
+
+    def restore_documents(
+        self, target_index: str, ndjson_file: BinaryIO, bulk_size: int
+    ) -> int:
+        pending: list[str] = []
+        restored = 0
+        for raw_line in ndjson_file:
+            parsed = parse_backup_document(raw_line)
+            if parsed is None:
+                continue
+            doc_id, source = parsed
+            action: dict[str, Any] = {"_index": target_index}
+            if doc_id:
+                action["_id"] = doc_id
+            pending.append(json.dumps({"index": action}, separators=(",", ":")))
+            pending.append(json.dumps(source, separators=(",", ":"), default=str))
+            restored += 1
+            if restored % bulk_size == 0:
+                self.send_bulk(pending)
+                pending = []
+                print(f"    uploaded {restored} documents", flush=True)
+        if pending:
+            self.send_bulk(pending)
+        return restored
+
+
+def prune_settings(raw: dict[str, Any]) -> dict[str, Any]:
+    settings: Any = raw.get("settings", raw)
+    if isinstance(settings, dict):
+        settings = settings.get("index", settings)
+    if not isinstance(settings, dict):
+        return {}
+    result = dict(settings)
+    for key in ("creation_date", "uuid", "version", "provided_name"):
+        result.pop(key, None)
+    for key in ("routing", "translog", "merge"):
+        result.pop(key, None)
+    return result
+
+
+def read_tar_json(tar: tarfile.TarFile, name: str) -> dict[str, Any]:
+    try:
+        member = tar.getmember(name)
+    except KeyError as exc:
+        raise ValueError(f"Backup archive is missing {name}") from exc
+    file_obj = tar.extractfile(member)
+    if file_obj is None:
+        raise ValueError(f"Backup archive member cannot be read: {name}")
+    payload = json.loads(file_obj.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Backup archive {name} must contain a JSON object")
+    return payload
+
+
+def open_backup(
+    backup_bytes: bytes,
+) -> tuple[tarfile.TarFile, dict[str, Any], dict[str, Any], BinaryIO]:
+    try:
+        tar = tarfile.open(fileobj=io.BytesIO(backup_bytes), mode="r:gz")
+    except tarfile.TarError as exc:
+        raise ValueError("Downloaded file is not a valid gzip tar backup") from exc
+
+    try:
+        mapping = read_tar_json(tar, "mapping.json")
+        settings = read_tar_json(tar, "settings.json")
+        ndjson_members = [
+            member
+            for member in tar.getmembers()
+            if member.isfile() and member.name.endswith(".ndjson")
+        ]
+        if len(ndjson_members) != 1:
+            raise ValueError(
+                "Backup archive must contain exactly one .ndjson document file"
+            )
+        ndjson_file = tar.extractfile(ndjson_members[0])
+        if ndjson_file is None:
+            raise ValueError("Backup archive NDJSON file cannot be read")
+        return tar, mapping, settings, ndjson_file
+    except Exception:
+        tar.close()
+        raise
+
+
+def parse_backup_document(raw_line: bytes) -> tuple[str | None, dict[str, Any]] | None:
+    line = raw_line.decode("utf-8").strip()
+    if not line:
+        return None
+    payload = json.loads(line)
+    if not isinstance(payload, dict):
+        raise ValueError("Each NDJSON line must contain a JSON object")
+
+    wrapper_keys = {"_opensearch_id", "_id", "_source"}
+    wrapped = (
+        "_source" in payload
+        and ("_opensearch_id" in payload or "_id" in payload)
+        and set(payload).issubset(wrapper_keys)
+    )
+    if wrapped:
+        source = payload["_source"]
+        if not isinstance(source, dict):
+            raise ValueError("Backup document _source must be a JSON object")
+        doc_id = payload.get("_opensearch_id") or payload.get("_id")
+        return (str(doc_id) if doc_id is not None else None, source)
+    return (None, payload)
+
+
+def split_indexes(values: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        result.extend(part.strip() for part in value.split(",") if part.strip())
+    invalid = [name for name in result if not INDEX_NAME_RE.fullmatch(name)]
+    if invalid:
+        raise ValueError(f"Invalid OpenSearch index name(s): {', '.join(invalid)}")
+    return list(dict.fromkeys(result))
+
+
+def env_or_prompt(name: str, prompt: str, secret: bool = False) -> str:
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    if not sys.stdin.isatty():
+        raise ValueError(f"Set {name} or supply its command-line option")
+    return (getpass.getpass(prompt) if secret else input(prompt)).strip()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Restore the latest per-index OpenSearch .tar.gz backups from GitHub."
+        )
+    )
+    parser.add_argument("--github-url", help="GitHub repository or tree URL")
+    parser.add_argument(
+        "--github-token",
+        help="GitHub token (prefer the GITHUB_TOKEN environment variable or prompt)",
+    )
+    parser.add_argument("--branch", help="Git branch; inferred from a /tree/ URL or defaults to release")
+    parser.add_argument("--base-path", help="Folder containing index folders; inferred from a /tree/ URL")
+    parser.add_argument("--opensearch-host", help="OpenSearch host or full http(s) URL")
+    parser.add_argument("--opensearch-username", help="OpenSearch username")
+    parser.add_argument(
+        "--opensearch-password",
+        help="OpenSearch password (prefer OPENSEARCH_PASSWORD or prompt)",
+    )
+    parser.add_argument(
+        "--index",
+        action="append",
+        default=[],
+        help="Index to restore; repeat it or use a comma-separated list",
+    )
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--all", action="store_true", help="Restore every discovered index")
+    selection.add_argument("--list", action="store_true", help="List recoverable indexes only")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Delete an existing target index before restore (destructive)",
+    )
+    parser.add_argument("--bulk-size", type=int)
+    parser.add_argument("--timeout", type=int)
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Disable OpenSearch TLS certificate verification",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    bulk_size = args.bulk_size or int(CONFIG.get("bulk_size", 500))
+    timeout = args.timeout or int(CONFIG.get("timeout_seconds", 120))
+    if bulk_size < 1 or bulk_size > 5000:
+        raise ValueError("--bulk-size must be between 1 and 5000")
+
+    github_url = args.github_url or str(CONFIG.get("github_url", "")).strip()
+    if not github_url:
+        github_url = env_or_prompt("GITHUB_REPO_URL", "GitHub repository URL: ")
+    location = parse_github_url(github_url)
+    branch = (
+        args.branch
+        or location.inferred_branch
+        or str(CONFIG.get("branch", "")).strip()
+        or "release"
+    )
+    configured_base_path = str(CONFIG.get("base_path", "."))
+    base_path = (
+        args.base_path
+        if args.base_path is not None
+        else location.inferred_base_path or configured_base_path
+    ).strip("/")
+    if base_path == ".":
+        base_path = ""
+    github_token = (
+        args.github_token
+        or os.getenv("GITHUB_TOKEN", "").strip()
+        or str(CONFIG.get("github_token", "")).strip()
+        or env_or_prompt("GITHUB_TOKEN", "GitHub token: ", secret=True)
+    )
+    github = GitHubClient(location.api_url, github_token, branch, timeout)
+
+    configured_indexes = CONFIG.get("index_names", [])
+    if isinstance(configured_indexes, str):
+        configured_indexes = [configured_indexes]
+    restore_all = args.all or bool(CONFIG.get("restore_all", False))
+    list_only = args.list or bool(CONFIG.get("list_only", False))
+    if args.index and (restore_all or list_only):
+        raise ValueError("Use --index, --all, or --list; do not combine them")
+    requested_indexes = (
+        [] if restore_all or list_only else split_indexes(args.index or configured_indexes)
+    )
+
+    # A pasted GitHub URL may point directly to an index folder, for example
+    # /tree/Release/agent. Detect that layout and treat its parent as the base
+    # path, avoiding an incorrect agent/agent/backups lookup.
+    direct_index: str | None = None
+    if base_path:
+        possible_index = base_path.rsplit("/", 1)[-1]
+        possible_root = base_path.rsplit("/", 1)[0] if "/" in base_path else ""
+        if INDEX_NAME_RE.fullmatch(possible_index):
+            try:
+                github.latest_backup(possible_index, possible_root)
+            except (FileNotFoundError, ValueError):
+                pass
+            else:
+                direct_index = possible_index
+                base_path = possible_root
+
+    if list_only or restore_all or not requested_indexes:
+        print(f"Discovering backups on branch {branch!r} under {base_path or '.'} ...")
+        discovered = [direct_index] if direct_index else github.discover_indexes(base_path)
+    else:
+        discovered = []
+
+    if list_only:
+        if not discovered:
+            print("No recoverable index backups found.")
+            return 1
+        for index_name in discovered:
+            latest = github.latest_backup(index_name, base_path)
+            print(f"{index_name}\t{latest.get('path', latest.get('name'))}")
+        return 0
+
+    if restore_all:
+        indexes = discovered
+    elif requested_indexes:
+        indexes = requested_indexes
+    else:
+        raise ValueError("Choose at least one --index, or use --all or --list")
+    if not indexes:
+        raise ValueError("No recoverable index backups found")
+
+    opensearch_host = args.opensearch_host or os.getenv("OPENSEARCH_URL")
+    if not opensearch_host:
+        host = (
+            os.getenv("OPENSEARCH_HOST", "").strip()
+            or str(CONFIG.get("opensearch_host", "")).strip()
+            or env_or_prompt("OPENSEARCH_HOST", "OpenSearch host: ")
+        )
+        if "://" in host:
+            opensearch_host = host
+        else:
+            scheme = (
+                os.getenv("OPENSEARCH_SCHEME", "").strip()
+                or str(CONFIG.get("opensearch_scheme", "https")).strip()
+            )
+            port = (
+                os.getenv("OPENSEARCH_PORT", "").strip()
+                or str(CONFIG.get("opensearch_port", 9200))
+            )
+            opensearch_host = f"{scheme}://{host}:{port}"
+    username = (
+        args.opensearch_username
+        or os.getenv("OPENSEARCH_USERNAME")
+        or os.getenv("OPENSEARCH_USER")
+        or str(CONFIG.get("opensearch_username", "admin"))
+    )
+    password = (
+        args.opensearch_password
+        or os.getenv("OPENSEARCH_PASSWORD", "").strip()
+        or str(CONFIG.get("opensearch_password", "")).strip()
+        or env_or_prompt("OPENSEARCH_PASSWORD", "OpenSearch password: ", secret=True)
+    )
+    verify_certs = bool(CONFIG.get("verify_certs", True)) and not args.insecure
+    opensearch = OpenSearchClient(
+        opensearch_host, username, password, verify_certs, timeout
+    )
+    opensearch.check_connection()
+
+    overwrite = args.overwrite or bool(CONFIG.get("overwrite_existing", False))
+    failures: list[tuple[str, str]] = []
+    for position, index_name in enumerate(indexes, start=1):
+        target_index = index_name
+        print(f"[{position}/{len(indexes)}] {index_name} -> {target_index}")
+        try:
+            backup = github.latest_backup(index_name, base_path)
+            backup_path = str(backup.get("path") or backup.get("name"))
+            print(f"    latest backup: {backup_path}")
+            backup_bytes = github.download(backup)
+            tar, mapping, settings, ndjson_file = open_backup(backup_bytes)
+            try:
+                print("    archive valid: mapping.json, settings.json, NDJSON")
+                exists = opensearch.index_exists(target_index)
+                if exists and overwrite:
+                    print(f"    deleting existing index {target_index}")
+                    opensearch.delete_index(target_index)
+                    exists = False
+                if not exists:
+                    opensearch.create_index(target_index, mapping, settings)
+                    print("    created index with archived mapping and settings")
+                else:
+                    print("    target exists; upserting documents without changing its schema")
+                count = opensearch.restore_documents(
+                    target_index, ndjson_file, bulk_size
+                )
+            finally:
+                tar.close()
+            print(f"    restored {count} documents")
+        except Exception as exc:  # continue so one bad index does not block the rest
+            failures.append((index_name, str(exc)))
+            print(f"    FAILED: {exc}", file=sys.stderr)
+
+    succeeded = len(indexes) - len(failures)
+    print(f"Restore complete: {succeeded} succeeded, {len(failures)} failed")
+    for index_name, error in failures:
+        print(f"  - {index_name}: {error}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ValueError, PermissionError, FileNotFoundError, requests.RequestException) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(2)
